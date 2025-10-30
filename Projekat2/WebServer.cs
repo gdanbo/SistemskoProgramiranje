@@ -9,28 +9,37 @@ using System.Threading.Tasks;
 
 public class WebServer
 {
-    private readonly HttpListener _listener = new HttpListener();
-    private readonly ConcurrentDictionary<string, string> _cache = new();
-    private readonly SemaphoreSlim _cacheLock = new(1, 1);
-    private readonly HttpClient _client = new HttpClient();
-    private bool _running;
+    private readonly HttpListener listener = new HttpListener();
+    private readonly ConcurrentDictionary<string, string> cache = new();
+    private readonly HttpClient client = new HttpClient();
 
     public WebServer(string prefix)
     {
-        _listener.Prefixes.Add(prefix);
+        listener.Prefixes.Add(prefix);
     }
 
-    public async Task StartAsync()
+    public void Start()
     {
-        _listener.Start();
-        _running = true;
+        listener.Start();
+        Task.Run(() => ListenLoopAsync());
 
-        while (_running)
+        Console.WriteLine("Listener startovan");
+    }
+
+    public void Stop()
+    {
+        listener.Stop();
+        listener.Close();
+    }
+
+    private async Task ListenLoopAsync()
+    {
+        while (true)
         {
             try
             {
-                HttpListenerContext context = await _listener.GetContextAsync();
-                _ = Task.Run(() => HandleRequest(context));
+                var ctx = await listener.GetContextAsync();
+                _ = Task.Run(() => HandleRequestAsync(ctx)); // discard operator jer iskazujemo nameru da necemo da awaitujemo ovde task.run jer nema potrebe
             }
             catch (HttpListenerException)
             {
@@ -43,7 +52,7 @@ public class WebServer
         }
     }
 
-    private async Task HandleRequest(HttpListenerContext ctx)
+    private async Task HandleRequestAsync(HttpListenerContext ctx)
     {
         var req = ctx.Request;
         var resp = ctx.Response;
@@ -55,13 +64,13 @@ public class WebServer
 
         try
         {
-            if (req.HttpMethod != "GET" || req.Url.AbsolutePath != "/search")
+            if (req.HttpMethod != "GET" || req.Url != null && req.Url.AbsolutePath != "/search")
             {
                 await WriteJsonAsync(resp, 405, "{\"error\": \"Koristiti GET metodu sa /search?q=...\"}");
                 return;
             }
 
-            string query = req.QueryString["q"];
+            string? query = req.QueryString["q"];
             if (string.IsNullOrWhiteSpace(query))
             {
                 await WriteJsonAsync(resp, 400, "{\"error\":\"Nedostaje parametar q.\"}");
@@ -70,8 +79,9 @@ public class WebServer
 
             string googleUrl = $"https://www.googleapis.com/books/v1/volumes?q={Uri.EscapeDataString(query)}";
 
-            if (_cache.TryGetValue(googleUrl, out string? cachedResponse))
+            if (cache.TryGetValue(googleUrl, out string? cachedResponse))
             {
+                Console.WriteLine($"Rezultat za {query} pronađen u kešu");
                 await WriteJsonAsync(resp, 200, cachedResponse); // vracamo kesiran odgovor
                 return;
             }
@@ -79,7 +89,7 @@ public class WebServer
             string responseBody;
             try
             {
-                HttpResponseMessage response = await _client.GetAsync(googleUrl);
+                HttpResponseMessage response = await client.GetAsync(googleUrl);
                 responseBody = await response.Content.ReadAsStringAsync();
 
                 if (!response.IsSuccessStatusCode)
@@ -102,15 +112,7 @@ public class WebServer
                 return;
             }
 
-            await _cacheLock.WaitAsync(); // cekamo semafor
-            try
-            {
-                _cache.TryAdd(googleUrl, responseBody);
-            }
-            finally
-            {
-                _cacheLock.Release();
-            }
+            cache.TryAdd(googleUrl, responseBody);
 
             await WriteJsonAsync(resp, 200, responseBody);
         }

@@ -1,14 +1,15 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Reactive;
 using System.Reactive.Concurrency;
 using System.Reactive.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using System.Collections.Generic;
-using System.Linq;
 
 public class ReactiveWebServer
 {
@@ -19,71 +20,67 @@ public class ReactiveWebServer
     {
         listener.Prefixes.Add(prefix);
     }
-    public async Task StartAsync()
+
+    public void Start()
     {
         listener.Start();
-        Console.WriteLine("Listener startovan");
 
-        while (true)
-        {
-            var ctx = await listener.GetContextAsync();
-            _ = Task.Run(() => HandleRequestAsync(ctx));
-        }
+        Observable
+            .Defer(() => Observable.FromAsync(listener.GetContextAsync))
+            .Repeat() // kad se ovaj observable zavrsi, tj. umesto OnCompleted, odmah ga ponovo pokrecemo
+            .ObserveOn(ThreadPoolScheduler.Instance) // obradu vrsimo na thread poolu
+            .SelectMany(ctx => HandleRequestReactive(ctx))
+            .Subscribe(
+                (nothing) => { }, // OnNext
+                (ex) => Console.WriteLine($"Exception: {ex.Message}"), // OnError
+                () => Console.WriteLine("Server pipeline zavrsen") // OnCompleted // nikad se ne desi zbog .Repeat()
+            );
     }
 
-    private async Task HandleRequestAsync(HttpListenerContext ctx)
+    public void Stop()
+    {
+        listener.Stop();
+        listener.Close();
+        Console.WriteLine("Server zaustavljen.");
+    }
+
+    private IObservable<Unit> HandleRequestReactive(HttpListenerContext ctx)
     {
         var req = ctx.Request;
         var resp = ctx.Response;
         var url = req.Url?.AbsolutePath ?? "";
 
-        Console.WriteLine($"[{DateTime.Now:dd.MM.yyyy HH:mm}] {req.HttpMethod} {req.Url}");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {req.HttpMethod} {req.Url}");
 
         if (req.HttpMethod != "GET" || url != "/search")
         {
-            await WriteJsonAsync(resp, 404, new { error = "Koristiti GET metodu sa /search?q=..." });
-            return;
+            return Observable.FromAsync(() => WriteJsonAsync(resp, 404, new { error = "Koristiti GET metodu sa /search?q=..." }));
         }
 
         var query = req.QueryString["q"];
         if (string.IsNullOrWhiteSpace(query))
         {
-            await WriteJsonAsync(resp, 400, new { error = "Nedostaje parametar q." });
-            return;
+            return Observable.FromAsync(() => WriteJsonAsync(resp, 400, new { error = "Nedostaje parametar q." }));
         }
 
-        // reaktivno
-        Observable.Return(query)
-            .ObserveOn(ThreadPoolScheduler.Instance)
-            .SelectMany(q => Observable.FromAsync(() => FetchBooksAsync(q)))
-            .SelectMany(json => Observable.FromAsync(()  => ProcessBooksAsync(json)))
-            .Subscribe(
-                async result =>
-                {
-                    await WriteJsonAsync(resp, 200, result);
-                    dynamic r = result;
-                    Console.WriteLine($"Pronađeno {r.UkupnoKnjiga} knjiga");
-                },
-                async ex =>
-                {
-                    await WriteJsonAsync(resp, 500, new { error = ex.Message });
-                    Console.WriteLine($"Exception: {ex.Message}");
-                });
+        // pipeline za obradu
+        return Observable.Return(query)
+            .SelectMany(q => Observable.FromAsync(() => FetchBooksAsync(q)))      // poziv Google Books API
+            .SelectMany(json => Observable.FromAsync(() => ProcessBooksAsync(json))) // obrada
+            .SelectMany(result => Observable.FromAsync(() => WriteJsonAsync(resp, 200, result))) // slanje odgovora
+            .Catch<Unit, Exception>(ex =>
+                Observable.FromAsync(() => WriteJsonAsync(resp, 500, new { error = ex.Message }))
+            );
     }
 
-    private async Task<string> FetchBooksAsync(string query)
+    private async Task<string> FetchBooksAsync(string author)
     {
-        string url = $"https://www.googleapis.com/books/v1/volumes?q={Uri.EscapeDataString(query)}";
-
-        //Console.WriteLine($"FetchBooksAsync {url}");
-
+        string url = $"https://www.googleapis.com/books/v1/volumes?q=inauthor:{Uri.EscapeDataString(author)}";
         var res = await http.GetAsync(url);
         var body = await res.Content.ReadAsStringAsync();
 
         if (!res.IsSuccessStatusCode)
-        {
             throw new Exception($"Google Books API greška: {res.StatusCode}");
-        }
 
         return body;
     }
@@ -106,9 +103,7 @@ public class ReactiveWebServer
             string desc = info.TryGetProperty("description", out var d) ? d.GetString() ?? "" : "";
 
             if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(desc))
-            {
                 continue;
-            }
 
             int velika = CountVelikaSlova(desc);
             int jedinstvene = CountJedinstveneReci(desc);
@@ -127,18 +122,12 @@ public class ReactiveWebServer
             .ThenByDescending(b => ((dynamic)b).JedinstveneReci)
             .ToList();
 
-        await Task.Yield();
-
-        return new
-        {
-            UkupnoKnjiga = sorted.Count,
-            Rezultati = sorted
-        };
+        return new { UkupnoKnjiga = sorted.Count, Rezultati = sorted };
     }
 
     private int CountVelikaSlova(string text)
     {
-        var words = text.Split(new[] { ' ', '\n', '\r', '\t', '\\', '-', '\"',  '.', ',', ';', ':', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
+        var words = text.Split(new[] { ' ', '\n', '\r', '\t', '\\', '-', '\"', '.', ',', ';', ':', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
         return words.Count(w => char.IsUpper(w[0]));
     }
 
@@ -150,7 +139,7 @@ public class ReactiveWebServer
         return words.Distinct().Count();
     }
 
-    private async Task WriteJsonAsync(HttpListenerResponse resp, int code, object obj)
+    private async Task<Unit> WriteJsonAsync(HttpListenerResponse resp, int code, object obj)
     {
         string json = JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true });
         byte[] data = Encoding.UTF8.GetBytes(json);
@@ -161,5 +150,7 @@ public class ReactiveWebServer
 
         await resp.OutputStream.WriteAsync(data, 0, data.Length);
         resp.OutputStream.Close();
+
+        return Unit.Default;
     }
 }

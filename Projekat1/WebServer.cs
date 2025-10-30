@@ -11,7 +11,6 @@ public class WebServer
     private readonly HttpListener listener = new HttpListener();
     private readonly Dictionary<string, string> cache = new Dictionary<string, string>();
     private readonly object cacheLock = new object();
-    private bool running = false;
 
     public WebServer(string prefix)
     {
@@ -20,14 +19,19 @@ public class WebServer
 
     public void Start()
     {
-        running = true;
         listener.Start();
         ThreadPool.QueueUserWorkItem(ListenLoop);
     }
 
-    private void ListenLoop(object state)
+    public void Stop()
     {
-        while (running)
+        listener.Stop();
+        listener.Close();
+    }
+
+    private void ListenLoop(object? state)
+    {
+        while (true)
         {
             try
             {
@@ -36,7 +40,11 @@ public class WebServer
             }
             catch (HttpListenerException)
             {
-                break;
+                break; // kad se pozove listener.Stop() vise ne dobijamo kontekst i baci se exception i mi ga ovde breakujemo, i onda nam ne treba running flag
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception: {ex.Message}");
             }
         }
     }
@@ -65,18 +73,26 @@ public class WebServer
                 return;
             }
 
-            string googleUrl = $"https://www.googleapis.com/books/v1/volumes?q={Uri.EscapeDataString(query)}";
-            string result;
+            string googleUrl = $"https://www.googleapis.com/books/v1/volumes?q={Uri.EscapeDataString(query)}"; //&fields=items";
+            string? result;
 
             lock (cacheLock)
             {
                 if (cache.ContainsKey(googleUrl)) // ako u cache vec imamo odgovor tog requesta vracamo odmah njega
                 {
                     result = cache[googleUrl];
-                    Console.WriteLine($"Pronađeno u kešu: {result}");
-                    WriteJson(resp, 200, result);
-                    return;
                 }
+                else
+                {
+                    result = null;
+                }
+            }
+
+            if (result != null)
+            {
+                Console.WriteLine($"Rezultat za {query} pronađen u kešu");
+                WriteJson(resp, 200, result);
+                return;
             }
 
             var client = new WebClient();

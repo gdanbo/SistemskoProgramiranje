@@ -1,12 +1,16 @@
 ﻿class Program
 {
-    static async Task Main()
+    public static void Main()
     {
         var server = new ReactiveWebServer("http://localhost:5050/");
-        await server.StartAsync();
+        server.Start();
 
         Console.WriteLine("Server pokrenut na http://localhost:5050/");
 
-        await Task.Delay(-1); // beskonacno
+        Console.WriteLine("\nPritisnite Enter za zaustavljanje servera");
+        Console.ReadLine();
+
+        Console.WriteLine("Server se zaustavlja...");
+        server.Stop();
     }
 }
